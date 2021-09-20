@@ -13,6 +13,7 @@ use crate::vdf::create_keyvalues;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fmt;
+use itertools::Itertools;
 //use alloc::vec::IntoIter;
 //use std::alloc::Global;
 //use std::io::Write;
@@ -81,26 +82,29 @@ struct Config {
     min_kills: u32
 }
 
-fn process_file(path: String, steam3: &String, cfg: &Config, next_path: &String) -> Result<(), MainError> {
-    let file = fs::read(&path)?;
+//Take a .dem path, the user-to-track's steam3 id, a cfg that determines how we record our streaks, return a tuple of the streaks and filepath
+fn process_file(path: String, steam3: &String, cfg: &Config) -> Option<(Vec<[u32; 2]>, String)> {
+    //setting up the demo reading
+    let file = fs::read(&path).ok()?;
 
     let demo = Demo::new(&file);
     let mut handler = DemoHandler::default();
 
     let mut stream = demo.get_stream();
-    let header = Header::read(&mut stream)?;
+    let header = Header::read(&mut stream).ok()?;
     handler.handle_header(&header);
 
     let mut packets = RawPacketStream::new(stream);
 
-    while let Some(packet) = packets.next(&handler.state_handler)? {
+    while let Some(packet) = packets.next(&handler.state_handler).ok()? {
         handler.handle_packet(packet).unwrap();
     }
 
     assert_eq!(false, packets.incomplete);
     let parser = DemoParser::new(demo.get_stream());
-    let (_, state) = parser.parse()?;
+    let (_, state) = parser.parse().ok()?;
 
+    //begin our own parsing
     let starttick: u32 = find_start(&state); //we use references otherwise they're a "moved resource" and we cant reuse it
 
     let streaks = find_my_streaks(
@@ -110,13 +114,16 @@ fn process_file(path: String, steam3: &String, cfg: &Config, next_path: &String)
         starttick);
     if streaks.len() == 0 {
         println!("No streaks ({})", path);
-        return Ok(())
+        return None;
     } else {
         println!("Found {} streaks ({})", streaks.len(), path);
-        let kvs: Vec<[(String, String); 4]> = create_keyvalues(streaks, next_path);
-        vdf::write_vdf(&path, kvs);
+        return Some((streaks, path));
     }
-    return Ok(())
+}
+
+fn streaks_to_vdf(streaks: Vec<[u32; 2]>, path: &String, next_path: &String) {
+    let kvs: Vec<[(String, String); 4]> = create_keyvalues(streaks, next_path);
+    vdf::write_vdf(path, kvs);
 }
 
 fn main() -> Result<(), MainError> {
@@ -147,14 +154,55 @@ fn main() -> Result<(), MainError> {
     }).collect::<Vec<&PathBuf>>();
 
     println!("Beginning processing of {} files", entriesFiltered.len());
-    let mut last: String = "".to_string();
-    for (idx, window) in entriesFiltered.windows(2).enumerate() { //returns items in the collection in pairs of 2
-        let e: String = window[0].to_str().unwrap().parse().unwrap();
-        let n: String = window[1].to_str().unwrap().parse().unwrap();
-        process_file(e, &steam3, &cfg, &n);
-        last = n; //this was easier than just indexing the last element because Rust sucks
+    let mut all_streaks: Vec<Vec<[u32; 2]>> = Vec::new();
+    let mut all_paths: Vec<String> = Vec::new();
+
+    for ent in entriesFiltered.iter() {
+        let e: String = ent.to_str().unwrap().parse().unwrap();
+        match process_file(e, &steam3, &cfg) {
+            Some(x) =>  {
+                all_streaks.push(x.0);
+                all_paths.push(x.1);
+            },
+            None => (),
+        }
     }
-    process_file(last, &steam3, &cfg, &"".to_string());
+/*
+    for s in all_streaks.iter().windows(2) {
+        streaks_to_vdf(s[0], s[0][1], s[1][1]); //the current item's streaks, the current item's path, the next item's path
+    }
+*/
+    println!("Creating VDFs");
+    /*
+    for ((streaks_a, path_a), (streaks_b, path_b)) in all_streaks.iter().tuple_windows() {
+        println!("{:?} {} {:?} {}", streaks_a, path_a, streaks_b, path_b);
+        streaks_to_vdf(streaks_a.to_vec(), path_a, path_b);
+    }
+
+
+    let mut t = all_streaks.iter().tuples();
+    for (i, (prev, next)) in t.by_ref().enumerate() {
+        println!("{} /\\ {:?} {:?}", i, prev, next);
+        streaks_to_vdf(prev.0.to_vec(), &prev.1, &next.1); //the streaks, the
+        if i+1 == all_streaks.len() / 2 { //if an even set, the next
+            streaks_to_vdf(next.0.to_vec(), &next.1, &"".to_string());
+        }
+    }
+    for (last_streaks, last_path) in t.into_buffer() {
+        println!("/\\ {:?} {}", last_streaks, &last_path);
+        streaks_to_vdf(last_streaks.to_vec(), last_path, &"".to_string());
+    }
+     */
+    //this isnt going to work... let me try uhhh... returning vec of streaks, vec of paths, and use indexing to get the matching paths
+
+    for (i, streaks) in all_streaks.iter().enumerate() {
+        let mut next: &String = &"".to_string();
+        if i+1 != all_streaks.len() {
+            next = &all_paths[i+1]
+        };
+        streaks_to_vdf(streaks.to_vec(), &all_paths[i], next)
+    }
+
     println!("Done processing");
     return Ok(())
 }
